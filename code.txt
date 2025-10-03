@@ -1,0 +1,141 @@
+# PHÁT HIỆN GIAO DỊCH THẺ TÍN DỤNG GIAN LẬN
+# Quy trình:
+# 1. Đọc dữ liệu
+# 2. Khám phá dữ liệu và xử lý mất cân bằng
+# 3. Chia tập train/test
+# 4. Huấn luyện Logistic Regression và Random Forest
+# 5. Đánh giá bằng ROC, Precision-Recall
+# 6. Lưu mô hình tốt nhất
+import os
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, precision_recall_curve, auc, roc_curve
+import joblib
+import matplotlib.pyplot as plt
+
+# 1. Đọc dữ liệu
+data_path = "creditcard.csv"   # đường dẫn file bạn đã upload
+if not os.path.exists(data_path):
+    raise FileNotFoundError("Không tìm thấy file, hãy chắc chắn đã upload creditcard.csv")
+
+df = pd.read_csv(data_path)
+print("Kích thước dữ liệu:", df.shape)
+print("Số lượng mẫu theo nhãn (0 = bình thường, 1 = gian lận):")
+print(df['Class'].value_counts())
+
+# 2. Xử lý dữ liệu
+# - Bỏ cột 'Time' vì ít hữu ích
+# - Do dữ liệu rất mất cân bằng (fraud ~0.17%), ta undersample để train nhanh hơn
+X = df.drop(columns=['Time','Class'], errors='ignore')
+y = df['Class']
+
+# Remove rows with NaN in y before splitting
+nan_rows = y.isna()
+X = X[~nan_rows]
+y = y[~nan_rows]
+
+# Tách ra toàn bộ mẫu gian lận
+fraud_df = df[df['Class']==1]
+n_fraud = len(fraud_df)
+
+# Lấy ngẫu nhiên một số mẫu bình thường với tỉ lệ 5:1 so với gian lận
+ratio = 5
+normal_df = df[df['Class']==0].sample(n=n_fraud*ratio, random_state=42)
+
+# Gộp lại thành tập con để huấn luyện
+subset_df = pd.concat([fraud_df, normal_df]).sample(frac=1, random_state=42)
+X_sub = subset_df.drop(columns=['Time','Class'], errors='ignore')
+y_sub = subset_df['Class']
+
+print("Tập huấn luyện con:", subset_df.shape)
+
+# 3. Chia train/val cho tập con
+X_train_sub, X_val_sub, y_train_sub, y_val_sub = train_test_split(
+    X_sub, y_sub, test_size=0.2, stratify=y_sub, random_state=42
+)
+
+# Đồng thời tách train/test từ tập dữ liệu gốc để đánh giá thực tế
+X_train_full, X_test_full, y_train_full, y_test_full = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# Chuẩn hóa dữ liệu (cần cho Logistic Regression)
+scaler = StandardScaler()
+X_train_sub_scaled = scaler.fit_transform(X_train_sub)
+X_val_sub_scaled = scaler.transform(X_val_sub)
+X_test_full_scaled = scaler.transform(X_test_full)
+
+# 4. Huấn luyện mô hình
+# a) Logistic Regression (có cân bằng trọng số class_weight='balanced')
+lr = LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)
+lr.fit(X_train_sub_scaled, y_train_sub)
+y_proba_lr = lr.predict_proba(X_test_full_scaled)[:,1]
+y_pred_lr = (y_proba_lr >= 0.5).astype(int)
+
+# b) Random Forest (ít cây và max_depth nhỏ để chạy nhanh)
+rf = RandomForestClassifier(n_estimators=80, max_depth=8,
+                            class_weight='balanced',
+                            random_state=42, n_jobs=-1)
+rf.fit(X_train_sub, y_train_sub)
+y_proba_rf = rf.predict_proba(X_test_full)[:,1]
+y_pred_rf = (y_proba_rf >= 0.5).astype(int)
+
+# 5. Hàm đánh giá
+def danh_gia(ten, y_true, y_pred, y_proba):
+    print(f"\n--- {ten} ---")
+    print("Ma trận nhầm lẫn (Confusion Matrix):\n", confusion_matrix(y_true, y_pred))
+    print("Báo cáo phân loại (Classification Report):\n", classification_report(y_true, y_pred, digits=4))
+    roc = roc_auc_score(y_true, y_proba)
+    prec, rec, _ = precision_recall_curve(y_true, y_proba)
+    pr_auc = auc(rec, prec)
+    print(f"ROC AUC: {roc:.4f} | PR AUC: {pr_auc:.4f}")
+    return roc, pr_auc, prec, rec
+
+roc_lr, pr_lr, prec_lr, rec_lr = danh_gia("Logistic Regression", y_test_full, y_pred_lr, y_proba_lr)
+roc_rf, pr_rf, prec_rf, rec_rf = danh_gia("Random Forest", y_test_full, y_pred_rf, y_proba_rf)
+
+# Vẽ ROC
+plt.figure()
+fpr_lr, tpr_lr, _ = roc_curve(y_test_full, y_proba_lr)
+fpr_rf, tpr_rf, _ = roc_curve(y_test_full, y_proba_rf)
+plt.plot(fpr_lr, tpr_lr, label=f"LR AUC={roc_lr:.4f}")
+plt.plot(fpr_rf, tpr_rf, label=f"RF AUC={roc_rf:.4f}")
+plt.plot([0,1],[0,1],'--')
+plt.xlabel("FPR (False Positive Rate)")
+plt.ylabel("TPR (True Positive Rate)")
+plt.title("Đường cong ROC")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Vẽ Precision-Recall
+plt.figure()
+plt.plot(rec_lr, prec_lr, label=f"LR PR_AUC={pr_lr:.4f}")
+plt.plot(rec_rf, prec_rf, label=f"RF PR_AUC={pr_rf:.4f}")
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Đường cong Precision-Recall")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# 6. Lưu mô hình tốt nhất
+if roc_lr >= roc_rf:
+    best = {'model': lr, 'scaler': scaler, 'features': list(X.columns)}
+    best_name = "logistic_regression"
+else:
+    best = {'model': rf, 'scaler': None, 'features': list(X.columns)}
+    best_name = "random_forest"
+
+out_path = f"/content/fraud_model_{best_name}.joblib"
+joblib.dump(best, out_path)
+print("Đã lưu mô hình tốt nhất tại:", out_path)
+
+# Xem top 10 đặc trưng quan trọng trong Random Forest
+if hasattr(rf, 'feature_importances_'):
+    fi = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
+    print("\nTop 10 đặc trưng quan trọng của Random Forest:\n", fi.head(10))
